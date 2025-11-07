@@ -1,0 +1,33 @@
+{
+  "version": "Pre-Release 1.1.4",
+  "items": [
+    {
+      "path": "README.txt",
+      "kind": "File",
+      "required": true,
+      "sha256": null,
+      "size": null,
+      "source": "Assets/Seed/README.txt"
+    },
+    {
+      "path": "Terminal.lnk",
+      "kind": "Shortcut",
+      "required": true
+    },
+    {
+      "path": "VPN.lnk",
+      "kind": "Shortcut",
+      "required": false
+    },
+    {
+      "path": "Email.lnk",
+      "kind": "Shortcut",
+      "required": false
+    },
+    {
+      "path": "Notes",
+      "kind": "Directory",
+      "required": true
+    }
+  ]
+}
