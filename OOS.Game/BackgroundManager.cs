@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Timers;
 using System.Windows;
+using OOS.Shared;
 
 namespace OOS.Game
 {

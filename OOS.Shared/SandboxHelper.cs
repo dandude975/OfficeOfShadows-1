@@ -10,13 +10,11 @@ namespace OOS.Shared
     public static class SandboxHelper
     {
         /// <summary>
-        /// Returns the Desktop sandbox path (e.g., "Desktop\Office Work Stuff").
+        /// Returns the Desktop sandbox path (e.g., "Desktop\\Office Work Stuff").
         /// If missing, creates it and seeds a README.
         /// </summary>
         public static string EnsureSandboxFolder()
         {
-            // If your project already exposes this via SharedPaths, keep it.
-            // Here we resolve a sane default if not present.
             var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
             var sandboxPath = Path.Combine(desktop, "Office Work Stuff");
 
@@ -38,7 +36,7 @@ namespace OOS.Shared
             Process.Start(new ProcessStartInfo
             {
                 FileName = path,
-                UseShellExecute = true // required to let the shell (Explorer) handle folders
+                UseShellExecute = true // Explorer
             });
         }
 
@@ -52,10 +50,6 @@ namespace OOS.Shared
 
 This folder is a safe in-game workspace. Files here may be created,
 modified, or removed by puzzles, scripts, and the in-game Terminal.
-
-Tips
- • You can open this folder any time from the game.
- • Nothing here touches your real system outside this sandbox.
 
 — Stay vigilant.";
             File.WriteAllText(readme, text);
