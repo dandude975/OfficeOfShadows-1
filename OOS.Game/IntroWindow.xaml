@@ -24,7 +24,7 @@
             </Border>
 
             <!-- Version text (top-left corner) -->
-            <TextBlock Text="Game version: Pre-Release 1.1.4"
+            <TextBlock Text="Game version: Pre-Release 1.1.5"
                        Foreground="#555555"
                        FontSize="11"
                        FontFamily="Consolas"

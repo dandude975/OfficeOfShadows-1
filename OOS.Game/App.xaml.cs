@@ -1,76 +1,122 @@
-﻿using OOS.Shared;
-using System;
+﻿using System;
 using System.IO;
-using System.Threading.Tasks;
+using System.Threading;
 using System.Windows;
+using OOS.Shared;
 
 namespace OOS.Game
 {
     public partial class App : Application
     {
-        private StoryController _story = new();
+        private static Mutex? _singleInstanceMutex;
+        private GameRuntime? _runtime;
 
-        protected override async void OnStartup(StartupEventArgs e)
+        protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
-            ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
-            if (!Progress.Exists())
+            // Keep the app alive even if there are no windows open.
+            this.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+            // Single-instance guard
+            var createdNew = false;
+            _singleInstanceMutex = new Mutex(initiallyOwned: true,
+                name: "Global\\OfficeOfShadows_SingleInstance",
+                createdNew: out createdNew);
+
+            if (!createdNew)
             {
-                if (!await ShowIntroAndVideoAsync()) { Shutdown(); return; }
+                MessageBox.Show("Office of Shadows is already running.", "Office of Shadows",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                Shutdown();
+                return;
             }
-            else
+
+            // Crash logging hooks
+            AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
             {
-                var resume = new ResumeWindow(_story.Progress);
-                resume.ShowDialog();
+                try { SharedLogger.Error("Fatal (AppDomain) exception:\n" + (ev.ExceptionObject as Exception)); }
+                catch { }
+            };
+            this.DispatcherUnhandledException += (s, ev) =>
+            {
+                try { SharedLogger.Error("Fatal (Dispatcher) exception:\n" + ev.Exception); }
+                catch { }
+                ev.Handled = false;
+            };
 
-                if (resume.Result == ResumeWindow.Choice.NewGame)
-                {
-                    _story.ResetProgress();
-                    if (!await ShowIntroAndVideoAsync()) { Shutdown(); return; }
-                }
-                // Continue = skip intro/video
-            }
+            // Load settings
+            var settings = SettingsStore.Load();
 
+            // Ensure Desktop sandbox exists
             var sandboxPath = SandboxHelper.EnsureSandboxFolder();
-            ShortcutHelper.CreateShortcutsIfMissing(sandboxPath);
 
-            var manifestPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "manifest.json");
-            var integrity = IntegrityManager.RunStartupCheck(manifestPath, sandboxPath);
-
-            // Optional: quick toast to tell you where the report went (helpful while developing)
-            System.Diagnostics.Debug.WriteLine($"Integrity: report={integrity.ReportPath}, issues={integrity.IssueCount}");
-
-            if (!string.IsNullOrEmpty(integrity.ReportPath))
+            // ----- Integrity check + small report window -----
+            try
             {
-                System.Windows.MessageBox.Show(
-                    $"Integrity check complete.\nIssues: {integrity.IssueCount}\nReport: {integrity.ReportPath}",
-                    "Office of Shadows");
+                var exeDir = AppContext.BaseDirectory;
+                var manifestPath = Path.Combine(exeDir, "Assets", "manifest.json");
+
+                string reportText = IntegrityManager.RunStartupCheck(manifestPath, sandboxPath);
+
+                var reportWindow = new IntegrityReportWindow(reportText);
+                reportWindow.Show();
             }
+            catch (Exception ex)
+            {
+                SharedLogger.Error("Integrity check failed:\n" + ex);
+            }
+            // -------------------------------------------------
 
 
-            _story.SetCheckpoint("tools_opened");
+            // Start background runtime (tray icon etc.)
+            _runtime = new GameRuntime();
+            _runtime.Start();
 
-            BackgroundManager.Instance.Start();
-            TrayIconManager.CreateTrayIcon();
+            // Determine first-run vs resume
+            var progress = Progress.Load() ?? new Progress();
+            var firstRun = string.IsNullOrWhiteSpace(progress.Checkpoint);
+
+            try
+            {
+                if (firstRun)
+                {
+                    var intro = new IntroWindow();
+                    intro.Show();
+                    // Explorer will open later after the video ends (VideoWindow handles it).
+                }
+                else
+                {
+                    var resume = new ResumeWindow(progress);
+                    resume.Show();
+                    // Explorer opens after Continue (handled in ResumeWindow).
+                }
+            }
+            catch (Exception ex)
+            {
+                SharedLogger.Error("Failed to open initial window:\n" + ex);
+                MessageBox.Show(
+                    "A critical error occurred while opening the game. Check the log for details.",
+                    "Office of Shadows",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
 
-        private async Task<bool> ShowIntroAndVideoAsync()
+        protected override void OnExit(ExitEventArgs e)
         {
-            var intro = new IntroWindow();
-            intro.ShowDialog();
-            if (!intro.UserConsented) return false;
-
-            var left = intro.Left; var top = intro.Top;
-            var clipPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "excoworker_clip.mp4");
-            if (File.Exists(clipPath))
+            try
             {
-                var video = new VideoWindow(clipPath, left, top);
-                await video.PlayAsync();
+                _runtime?.Dispose();
+                SharedLogger.Info("Application exiting.");
             }
-
-            _story.SetCheckpoint("video_played");
-            return true;
+            catch { }
+            finally
+            {
+                _singleInstanceMutex?.ReleaseMutex();
+                _singleInstanceMutex?.Dispose();
+                _singleInstanceMutex = null;
+            }
+            base.OnExit(e);
         }
     }
 }

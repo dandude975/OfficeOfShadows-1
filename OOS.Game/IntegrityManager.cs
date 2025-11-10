@@ -1,227 +1,361 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
-using OOS.Shared;
+using System.Text.Json;
 
-namespace OOS.Game
+namespace OOS.Shared
 {
-    internal static class IntegrityManager
+    public static class IntegrityManager
     {
-        public sealed class Result
-        {
-            public string ReportPath { get; init; } = "";
-            public int IssueCount { get; init; }          // -1 = no manifest, -2 = crash
-            public bool ManifestFound { get; init; }
-        }
-
         /// <summary>
-        /// Validate sandbox against manifest; auto-repair where possible; write a human-readable report.
-        /// Returns the report path and issue count.
+        /// Runs startup integrity/repair and returns a human-readable report.
+        /// - Ensures sandbox exists and seeds README.txt.
+        /// - Parses ./Assets/manifest.json, creating dirs/files and SPECIAL-CASE creating .lnk files.
+        /// - Mirrors any missing files from ./Assets/SandboxSeed/.
         /// </summary>
-        public static Result RunStartupCheck(string manifestPath, string sandboxRoot)
+        public static string RunStartupCheck(string manifestPath, string sandboxPath)
         {
-            var report = new List<string>
-            {
-                "Office of Shadows – Integrity Check",
-                $"Manifest: {manifestPath}",
-                $"Sandbox : {sandboxRoot}",
-                $"Date    : {DateTime.Now}",
-                ""
-            };
+            var lines = new List<string>();
+            int checkedCount = 0, repairedCount = 0, seededCount = 0, warnings = 0;
 
             try
             {
-                if (!File.Exists(manifestPath))
+                if (string.IsNullOrWhiteSpace(sandboxPath))
+                    return "Integrity: invalid sandbox path.";
+
+                if (!Directory.Exists(sandboxPath))
+                    Directory.CreateDirectory(sandboxPath);
+
+                // Always ensure README for immersion
+                var readme = Path.Combine(sandboxPath, "README.txt");
+                if (!File.Exists(readme))
                 {
-                    report.Add("ERROR: Manifest not found. Skipping validation.");
-                    var missPath = WriteReport(sandboxRoot, report);
-                    Debug.WriteLine($"Integrity: no manifest; report at {missPath}");
-                    return new Result { ReportPath = missPath, IssueCount = -1, ManifestFound = false };
+                    File.WriteAllText(readme,
+@"Office of Shadows — Desktop Sandbox
+
+This folder is a safe in-game workspace. Files here may be created,
+modified, or removed by puzzles, scripts, and the in-game Terminal.
+
+— Stay vigilant.");
+                    repairedCount++;
+                    lines.Add("Seeded README.txt");
                 }
 
-                var manifest = SandboxManifest.Load(manifestPath);
-                var issues = new List<Discrepancy>(manifest.Validate(sandboxRoot));
-
-                if (issues.Count == 0)
+                // ---- MANIFEST PROCESSING ----
+                var exeDir = AppContext.BaseDirectory;
+                if (!string.IsNullOrWhiteSpace(manifestPath) && File.Exists(manifestPath))
                 {
-                    report.Add("All items match the manifest.");
-                    var okPath = WriteReport(sandboxRoot, report);
-                    Debug.WriteLine($"Integrity: ok; report at {okPath}");
-                    return new Result { ReportPath = okPath, IssueCount = 0, ManifestFound = true };
-                }
+                    using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath));
+                    var root = doc.RootElement;
 
-                report.Add($"Found {issues.Count} issue(s). Attempting auto-repair where possible…");
-                report.Add("");
-
-                foreach (var d in issues)
-                {
-                    report.Add($"- {d.Kind}: {d.Item.Path} ({d.Details})");
-
-                    try
+                    // Common array property names we’ll accept
+                    string[] listNames = { "files", "items", "entries" };
+                    if (TryGetFirstArray(root, listNames, out var list))
                     {
-                        switch (d.Item.Kind)
+                        foreach (var el in list.EnumerateArray())
                         {
-                            case ItemKind.Directory:
-                                EnsureDirectory(d.FullPath, report);
-                                break;
+                            string? rel = TryGetString(el, "path")
+                                          ?? TryGetString(el, "relativePath")
+                                          ?? TryGetString(el, "target")
+                                          ?? TryGetString(el, "to");
 
-                            case ItemKind.Shortcut:
-                                RepairShortcut(d, sandboxRoot, report);
-                                break;
+                            bool required = TryGetBool(el, "required") ?? false;
+                            string? type = TryGetString(el, "type");
 
-                            case ItemKind.File:
-                                RepairFile(d, report);
-                                break;
+                            if (string.IsNullOrWhiteSpace(rel))
+                                continue;
+
+                            // Normalize separators
+                            rel = rel.Replace('/', Path.DirectorySeparatorChar)
+                                     .Replace('\\', Path.DirectorySeparatorChar);
+
+                            checkedCount++;
+
+                            var targetPath = Path.Combine(sandboxPath, rel);
+
+                            // Determine if entry is a directory.
+                            bool looksDir =
+                                rel.EndsWith(Path.DirectorySeparatorChar) ||
+                                (type?.Equals("dir", StringComparison.OrdinalIgnoreCase) ?? false) ||
+                                (TryGetBool(el, "isDir") ?? false) ||
+                                // NEW: treat plain names with no extension as directories (e.g., "Notes")
+                                !Path.HasExtension(rel);
+
+                            if (looksDir)
+                            {
+                                if (!Directory.Exists(targetPath))
+                                {
+                                    Directory.CreateDirectory(targetPath);
+                                    repairedCount++;
+                                    lines.Add($"Created directory: {rel.TrimEnd(Path.DirectorySeparatorChar)}");
+                                }
+                                continue;
+                            }
+
+                            // Special-case shortcuts (.lnk)
+                            if (rel.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+                            {
+                                HandleShortcut(rel, sandboxPath, exeDir, required, lines, ref repairedCount, ref warnings);
+                                continue;
+                            }
+
+                            // Regular file: copy from ./Assets/<rel> if missing
+                            var sourcePath = Path.Combine(exeDir, "Assets", rel);
+                            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+
+                            if (!File.Exists(targetPath))
+                            {
+                                if (File.Exists(sourcePath))
+                                {
+                                    File.Copy(sourcePath, targetPath, overwrite: false);
+                                    repairedCount++;
+                                    lines.Add($"Restored file: {rel}");
+                                }
+                                else
+                                {
+                                    warnings++;
+                                    lines.Add($"Missing source for: {rel}");
+                                }
+                            }
                         }
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        report.Add($"  Repair failed: {ex.Message}");
+                        lines.Add("Manifest present but contains no 'files'/'items'/'entries' array.");
+                    }
+                }
+                else
+                {
+                    lines.Add("Manifest not found; skipping manifest-driven repair.");
+                }
+
+                // ---- SandboxSeed mirror (optional) ----
+                var seedDir = Path.Combine(AppContext.BaseDirectory, "Assets", "SandboxSeed");
+                if (Directory.Exists(seedDir))
+                {
+                    foreach (var src in Directory.GetFiles(seedDir, "*", SearchOption.AllDirectories))
+                    {
+                        var rel = Path.GetRelativePath(seedDir, src);
+                        var dst = Path.Combine(sandboxPath, rel);
+                        if (!File.Exists(dst))
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                            File.Copy(src, dst, overwrite: false);
+                            seededCount++;
+                            lines.Add($"Seeded from SandboxSeed: {rel}");
+                        }
                     }
                 }
 
-                var written = WriteReport(sandboxRoot, report);
-                Debug.WriteLine($"Integrity: repaired {issues.Count}; report at {written}");
-                return new Result { ReportPath = written, IssueCount = issues.Count, ManifestFound = true };
+                lines.Insert(0, $"Checked: {checkedCount} | Repaired: {repairedCount} | Seeded: {seededCount}");
             }
             catch (Exception ex)
             {
-                report.Add("");
-                report.Add($"FATAL: {ex.Message}");
-                var written = WriteReport(sandboxRoot, report);
-                Debug.WriteLine($"Integrity: crash; report at {written}");
-                return new Result { ReportPath = written, IssueCount = -2, ManifestFound = false };
+                var msg = "IntegrityManager.RunStartupCheck exception:\n" + ex;
+                SharedLogger.Error(msg);
+                lines.Add(msg);
             }
+
+            return string.Join(Environment.NewLine, lines);
         }
 
-        // ---------- Repairs ----------
+        // ---------- Shortcuts ----------
 
-        private static void EnsureDirectory(string path, List<string> report)
+        private static void HandleShortcut(
+            string relativeLinkName,
+            string sandboxPath,
+            string exeDir,
+            bool required,
+            List<string> lines,
+            ref int repairedCount,
+            ref int warnings)
         {
-            if (!Directory.Exists(path))
+            string linkPath = Path.Combine(sandboxPath, relativeLinkName);
+            Directory.CreateDirectory(Path.GetDirectoryName(linkPath)!);
+
+            // If the shortcut already exists, do nothing (fixes "Created shortcut" every run).
+            if (File.Exists(linkPath))
             {
-                Directory.CreateDirectory(path);
-                report.Add("  Repaired: Created directory.");
+                lines.Add($"Shortcut OK: {relativeLinkName}");
+                return;
+            }
+
+            // Decide what the link should point to
+            string lower = relativeLinkName.ToLowerInvariant();
+
+            if (lower == "terminal.lnk")
+            {
+                string? terminalExe = FindTerminalExe(exeDir);
+                if (terminalExe != null)
+                {
+                    if (CreateWindowsShortcut(linkPath, terminalExe, Path.GetDirectoryName(terminalExe)!))
+                    {
+                        repairedCount++;
+                        lines.Add("Created shortcut: Terminal.lnk");
+                    }
+                    else if (CreateUrlShortcutFallback(linkPath, terminalExe))
+                    {
+                        repairedCount++;
+                        lines.Add("Created fallback shortcut (.url): Terminal.lnk → OOS.Terminal.exe");
+                    }
+                    else
+                    {
+                        warnings++;
+                        lines.Add("Failed to create Terminal.lnk (no WSH and .url fallback failed).");
+                    }
+                }
+                else
+                {
+                    warnings++;
+                    lines.Add("Cannot locate OOS.Terminal.exe to create Terminal.lnk");
+                }
+            }
+            else if (lower == "vpn.lnk" || lower == "email.lnk")
+            {
+                // Optional shortcuts (by design). Only warn if required=true
+                if (required)
+                {
+                    warnings++;
+                    lines.Add($"Missing source for: {relativeLinkName} (marked required)");
+                }
+                else
+                {
+                    lines.Add($"Optional shortcut skipped: {relativeLinkName}");
+                }
+            }
+            else
+            {
+                // Unknown .lnk from manifest — copy if present in Assets
+                var assetsSource = Path.Combine(exeDir, "Assets", relativeLinkName);
+                if (File.Exists(assetsSource))
+                {
+                    File.Copy(assetsSource, linkPath, overwrite: true);
+                    repairedCount++;
+                    lines.Add($"Restored shortcut from Assets: {relativeLinkName}");
+                }
+                else
+                {
+                    warnings++;
+                    lines.Add($"Missing source for: {relativeLinkName}");
+                }
             }
         }
 
-        private static void RepairShortcut(Discrepancy d, string sandboxRoot, List<string> report)
+        private static string? FindTerminalExe(string exeDir)
         {
-            // Try a specific shortcut recreation; if not available, recreate all known shortcuts.
-            var appName = AppNameFromShortcut(d.Item.Path);
-            var ok = false;
+            // 1) Same folder as the game
+            var probe1 = Path.Combine(exeDir, "OOS.Terminal.exe");
+            if (File.Exists(probe1)) return probe1;
 
+            // 2) Common dev layout: sibling project bin
             try
             {
-                ok = ShortcutHelper.CreateShortcutForApp(
-                        sandboxRoot,
-                        d.Item.Path,                // e.g., "Terminal.lnk"
-                        appName,                    // e.g., "OOS.Terminal"
-                        "Office of Shadows tool");
-            }
-            catch
-            {
-                // ignore and try bulk creation
-            }
-
-            if (!ok)
-            {
-                try
+                var root = Directory.GetParent(exeDir)?.Parent?.Parent?.Parent?.FullName; // heuristic
+                if (!string.IsNullOrEmpty(root))
                 {
-                    ShortcutHelper.CreateShortcutsIfMissing(sandboxRoot);
-                    // confirm creation
-                    ok = File.Exists(Path.Combine(sandboxRoot, d.Item.Path));
+                    var candidates = Directory.GetFiles(root, "OOS.Terminal.exe", SearchOption.AllDirectories);
+                    foreach (var c in candidates)
+                    {
+                        if (c.Contains("net", StringComparison.OrdinalIgnoreCase))
+                            return c;
+                    }
+                    if (candidates.Length > 0) return candidates[0];
                 }
-                catch { /* ignore */ }
             }
+            catch { /* best-effort */ }
 
-            report.Add(ok
-                ? "  Repaired: Recreated shortcut."
-                : "  Could not repair: Target EXE not found.");
-        }
-
-        private static void RepairFile(Discrepancy d, List<string> report)
-        {
-            // If the manifest provides a source asset, copy it safely.
-            if (!string.IsNullOrWhiteSpace(d.Item.Source))
+            // 3) Local recursive search
+            try
             {
-                var src = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, d.Item.Source);
-                if (File.Exists(src))
-                {
-                    SafetyManager.SafeCopy(src, d.FullPath);
-                    report.Add($"  Repaired: Copied from {d.Item.Source}");
-                    return;
-                }
-
-                report.Add($"  Could not repair: Source not found: {src}");
-                return;
+                var candidates = Directory.GetFiles(exeDir, "OOS.Terminal.exe", SearchOption.AllDirectories);
+                if (candidates.Length > 0) return candidates[0];
             }
+            catch { }
 
-            // Special-case README (regenerate text if missing/corrupt and no source provided).
-            if (string.Equals(Path.GetFileName(d.FullPath), "README.txt", StringComparison.OrdinalIgnoreCase))
-            {
-                SafetyManager.SafeWriteText(d.FullPath, DefaultReadme());
-                report.Add("  Repaired: Regenerated README content.");
-                return;
-            }
-
-            report.Add("  No repair source specified.");
+            return null;
         }
-
-        // ---------- Helpers ----------
 
         /// <summary>
-        /// Primary: write to EXE\FileValidation; fallback: sandbox\_integrity_report.txt.
-        /// Returns actual path written.
+        /// Create a .lnk using late-bound Windows Script Host (no compile-time COM reference needed).
+        /// Sets icon to the standard cmd.exe icon.
         /// </summary>
-        private static string WriteReport(string sandboxRoot, List<string> lines)
+        private static bool CreateWindowsShortcut(string linkPath, string targetExe, string workingDir)
         {
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var outDir = Path.Combine(baseDir, "FileValidation");
-            var file = Path.Combine(outDir, $"integrity_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-
             try
             {
-                Directory.CreateDirectory(outDir);
-                File.WriteAllLines(file, lines);
-                return file;
+                var shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) return false;
+
+                dynamic shell = Activator.CreateInstance(shellType)!;
+                dynamic shortcut = shell.CreateShortcut(linkPath);
+                shortcut.TargetPath = targetExe;
+                shortcut.WorkingDirectory = workingDir;
+                shortcut.WindowStyle = 1; // normal window
+
+                // Use the cmd.exe icon for the terminal shortcut
+                var system32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                var cmdIcon = Path.Combine(system32, "cmd.exe");
+                shortcut.IconLocation = cmdIcon + ",0";
+
+                shortcut.Description = "Office of Shadows Terminal";
+                shortcut.Save();
+                return File.Exists(linkPath);
             }
             catch
             {
-                try
-                {
-                    var fallback = Path.Combine(sandboxRoot, "_integrity_report.txt");
-                    File.WriteAllLines(fallback, lines);
-                    return fallback;
-                }
-                catch
-                {
-                    return "";
-                }
+                return false;
             }
         }
 
-        private static string AppNameFromShortcut(string linkPath)
+        /// <summary>
+        /// If .lnk creation isn't possible, write a .url Internet shortcut as a fallback.
+        /// Explorer treats it as a clickable link to the local exe.
+        /// </summary>
+        private static bool CreateUrlShortcutFallback(string linkPath, string targetExe)
         {
-            var name = Path.GetFileNameWithoutExtension(linkPath).ToLowerInvariant();
-            return name switch
+            try
             {
-                "terminal" => "OOS.Terminal",
-                "vpn" => "OOS.VPN",
-                "email" => "OOS.Email",
-                _ => "OOS.Terminal"
-            };
+                var urlPath = Path.ChangeExtension(linkPath, ".url");
+                var uri = new Uri(targetExe);
+                File.WriteAllText(urlPath,
+                    $"[InternetShortcut]{Environment.NewLine}URL=file:///{uri.LocalPath.Replace('\\', '/')}{Environment.NewLine}");
+                return File.Exists(urlPath);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
-        private static string DefaultReadme() =>
-@"OFFICE OF SHADOWS – Liam’s Info
+        // ---------- JSON helpers ----------
 
-This folder is where your investigation tools, notes, and clues will appear.
+        private static bool TryGetFirstArray(JsonElement obj, string[] names, out JsonElement array)
+        {
+            foreach (var n in names)
+            {
+                if (obj.TryGetProperty(n, out var el) && el.ValueKind == JsonValueKind.Array)
+                {
+                    array = el;
+                    return true;
+                }
+            }
+            array = default;
+            return false;
+        }
 
-If items are missing, the game will attempt to repair them automatically on startup.
-You can reopen the game to rebuild critical files and shortcuts.
+        private static string? TryGetString(JsonElement el, string name)
+            => el.ValueKind == JsonValueKind.Object
+               && el.TryGetProperty(name, out var v)
+               && v.ValueKind == JsonValueKind.String
+                   ? v.GetString()
+                   : null;
 
-– RETIS Software";
+        private static bool? TryGetBool(JsonElement el, string name)
+        {
+            if (el.ValueKind != JsonValueKind.Object || !el.TryGetProperty(name, out var v)) return null;
+            if (v.ValueKind == JsonValueKind.True) return true;
+            if (v.ValueKind == JsonValueKind.False) return false;
+            return null;
+        }
     }
 }

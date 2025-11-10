@@ -1,94 +1,96 @@
-﻿using System;
+﻿using OOS.Shared;
+using System;
 using System.IO;
-using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
 
 namespace OOS.Game
 {
     public partial class VideoWindow : Window
     {
-        private TaskCompletionSource<bool>? _tcs;
-
-        // Size bounds (tweak to taste)
-        private const double MIN_W = 880;   // slightly larger than intro
-        private const double MIN_H = 540;
-        private const double MAX_W = 1100;  // cap so huge videos don't fill the screen
-        private const double MAX_H = 700;
-
-        public VideoWindow(string path, double? left = null, double? top = null)
+        public VideoWindow()
         {
             InitializeComponent();
-
-            // — Position to match the intro (safe fallback to centering) —
-            if (left.HasValue && top.HasValue &&
-                !double.IsNaN(left.Value) && !double.IsInfinity(left.Value) &&
-                !double.IsNaN(top.Value) && !double.IsInfinity(top.Value))
-            {
-                WindowStartupLocation = WindowStartupLocation.Manual;
-                Left = left.Value;
-                Top = top.Value;
-            }
-            else
-            {
-                WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            }
-
-            // — Resolve path (accept relative or absolute) —
-            string full = Path.IsPathRooted(path)
-                ? path
-                : Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, path));
-
-            video.Source = new Uri(full, UriKind.Absolute);
-
-            // — Sizing once media is ready —
-            video.MediaOpened += (s, e) =>
-            {
-                int natW = video.NaturalVideoWidth;
-                int natH = video.NaturalVideoHeight;
-
-                if (natW > 0 && natH > 0)
-                {
-                    // Scale uniformly to fit within MAX bounds (no cropping), then enforce MIN bounds
-                    double kW = MAX_W / natW;
-                    double kH = MAX_H / natH;
-                    double k = Math.Min(Math.Min(kW, kH), 1.0); // don't upscale above MAX
-
-                    double targetW = Math.Max(natW * k, MIN_W);
-                    double targetH = Math.Max(natH * k, MIN_H);
-
-                    video.Width = targetW;
-                    video.Height = targetH;
-                }
-                else
-                {
-                    // If unknown, use a sensible default
-                    video.Width = MIN_W;
-                    video.Height = MIN_H;
-                }
-            };
-
-            video.MediaEnded += (s, e) => _tcs?.TrySetResult(true);
-            video.MediaFailed += (s, e) =>
-            {
-                MessageBox.Show(
-                    $"Failed to play video:\n{full}\n\n{e.ErrorException?.Message}",
-                    "Office of Shadows");
-                _tcs?.TrySetResult(true);
-            };
+            TryStartVideo();
         }
 
-        public Task PlayAsync()
+        private void TryStartVideo()
         {
-            _tcs = new TaskCompletionSource<bool>();
-            Show();
-            video.Play();
-            return _tcs.Task.ContinueWith(_ => Dispatcher.Invoke(Close));
+            try
+            {
+                // Video expected at: <exeDir>\Assets\excoworker_clip.mp4
+                var exeDir = AppContext.BaseDirectory;
+                var videoPath = Path.Combine(exeDir, "Assets", "excoworker_clip.mp4");
+
+                if (!File.Exists(videoPath))
+                {
+                    SharedLogger.Warn("Intro video not found at: " + videoPath);
+                    FinishVideoFlow(); // Fail gracefully into the game
+                    return;
+                }
+
+                var uri = new Uri(videoPath, UriKind.Absolute);
+                VideoPlayer.Source = uri;
+
+                // Play
+                VideoPlayer.LoadedBehavior = MediaState.Manual;
+                VideoPlayer.UnloadedBehavior = MediaState.Manual;
+                VideoPlayer.Volume = 1.0;
+
+                // WPF sometimes needs a Dispatcher defer to actually start playback
+                this.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try { VideoPlayer.Play(); }
+                    catch (Exception exPlay)
+                    {
+                        SharedLogger.Warn("Video playback failed to start:\n" + exPlay);
+                        FinishVideoFlow();
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                SharedLogger.Warn("TryStartVideo failed:\n" + ex);
+                FinishVideoFlow();
+            }
         }
 
-        protected override void OnClosed(EventArgs e)
+        private void VideoPlayer_MediaEnded(object sender, RoutedEventArgs e)
         {
-            try { video.Stop(); } catch { /* ignore */ }
-            base.OnClosed(e);
+            FinishVideoFlow();
+        }
+
+        private void VideoPlayer_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+        {
+            SharedLogger.Warn("MediaFailed: " + e.ErrorException);
+            FinishVideoFlow();
+        }
+
+        private void SkipButton_Click(object sender, RoutedEventArgs e)
+        {
+            FinishVideoFlow();
+        }
+
+        /// <summary>
+        /// After the intro video finishes (or fails/skips), open the sandbox folder and close the window.
+        /// </summary>
+        private void FinishVideoFlow()
+        {
+            try
+            {
+                var settings = SettingsStore.Load();
+                if (settings.OpenSandboxOnStart)
+                    SandboxHelper.OpenSandboxFolder();
+            }
+            catch (Exception exOpen)
+            {
+                SharedLogger.Warn("Opening sandbox folder failed from VideoWindow:\n" + exOpen);
+            }
+            finally
+            {
+                this.Close();
+            }
         }
     }
 }
