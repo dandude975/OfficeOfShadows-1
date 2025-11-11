@@ -51,6 +51,16 @@ namespace OOS.Game
             }
         }
 
+        private void ResumeWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            // Make sure it’s visible on first paint, then drop Topmost.
+            this.Topmost = true;
+            Dispatcher.BeginInvoke(new Action(() => this.Topmost = false), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        }
+
+        private void Close_Click(object sender, RoutedEventArgs e) => this.Close();
+
+
         // CONTINUE
         private void ContinueBtn_Click(object sender, RoutedEventArgs e)
         {
