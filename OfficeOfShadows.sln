@@ -11,6 +11,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OOS.Shared", "OOS.Shared\OO
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OOS.DeviceManager", "OOS.DeviceManager\OOS.DeviceManager.csproj", "{CA469E1D-73CE-474A-8C3D-15DFF64727C8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OOS.Firewall", "OOS.Firewall\OOS.Firewall.csproj", "{EEB68FEF-A30A-4884-A2F5-662811B9E00E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -33,6 +35,10 @@ Global
 		{CA469E1D-73CE-474A-8C3D-15DFF64727C8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{CA469E1D-73CE-474A-8C3D-15DFF64727C8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{CA469E1D-73CE-474A-8C3D-15DFF64727C8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EEB68FEF-A30A-4884-A2F5-662811B9E00E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EEB68FEF-A30A-4884-A2F5-662811B9E00E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EEB68FEF-A30A-4884-A2F5-662811B9E00E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EEB68FEF-A30A-4884-A2F5-662811B9E00E}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

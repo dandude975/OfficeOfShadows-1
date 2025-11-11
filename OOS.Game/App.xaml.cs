@@ -1,122 +1,124 @@
-﻿using System;
+﻿using OOS.Shared;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using System.Threading;
+using System.Linq;
+using System.Threading.Tasks;
 using System.Windows;
-using OOS.Shared;
+using System.Windows.Threading;
 
 namespace OOS.Game
 {
     public partial class App : Application
     {
-        private static Mutex? _singleInstanceMutex;
-        private GameRuntime? _runtime;
+        private Window? _hostWindow;
 
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
 
-            // Keep the app alive even if there are no windows open.
-            this.ShutdownMode = ShutdownMode.OnExplicitShutdown;
-
-            // Single-instance guard
-            var createdNew = false;
-            _singleInstanceMutex = new Mutex(initiallyOwned: true,
-                name: "Global\\OfficeOfShadows_SingleInstance",
-                createdNew: out createdNew);
-
-            if (!createdNew)
-            {
-                MessageBox.Show("Office of Shadows is already running.", "Office of Shadows",
-                    MessageBoxButton.OK, MessageBoxImage.Information);
-                Shutdown();
-                return;
-            }
-
-            // Crash logging hooks
-            AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
-            {
-                try { SharedLogger.Error("Fatal (AppDomain) exception:\n" + (ev.ExceptionObject as Exception)); }
-                catch { }
-            };
+            // Show any exceptions instead of “silent nothing”
             this.DispatcherUnhandledException += (s, ev) =>
             {
-                try { SharedLogger.Error("Fatal (Dispatcher) exception:\n" + ev.Exception); }
-                catch { }
-                ev.Handled = false;
+                MessageBox.Show(ev.Exception.ToString(), "Unhandled UI Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                ev.Handled = true;
+            };
+            AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
+            {
+                var ex = ev.ExceptionObject as Exception;
+                MessageBox.Show(ex?.ToString() ?? "Non-Exception crash", "Unhandled BG Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            };
+            TaskScheduler.UnobservedTaskException += (s, ev) =>
+            {
+                MessageBox.Show(ev.Exception.ToString(), "Unobserved Task Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                ev.SetObserved();
             };
 
-            // Load settings
-            var settings = SettingsStore.Load();
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
-            // Ensure Desktop sandbox exists
-            var sandboxPath = SandboxHelper.EnsureSandboxFolder();
+            // Invisible host to anchor lifetime
+            _hostWindow = new Window
+            {
+                Width = 0,
+                Height = 0,
+                ShowInTaskbar = false,
+                WindowStyle = WindowStyle.None,
+                AllowsTransparency = true,
+                Opacity = 0
+            };
+            _hostWindow.Show();
+            MainWindow = _hostWindow;
 
-            // ----- Integrity check + small report window -----
+            // --- Integrity (unchanged) ---
+            var installRoot = AppDomain.CurrentDomain.BaseDirectory;
+            var sandboxPath = ResolveSandboxPath();
+            var mgr = new IntegrityManager();
+            var log = new List<string>();
             try
             {
-                var exeDir = AppContext.BaseDirectory;
-                var manifestPath = Path.Combine(exeDir, "Assets", "manifest.json");
+                mgr.RunStartupCheck(sandboxPath, installRoot, s =>
+                {
+                    log.Add(s);
+                    Debug.WriteLine(s);
+                }).GetAwaiter().GetResult();
+            }
+            catch (Exception ex) { log.Add($"[Integrity] Fatal error: {ex}"); }
 
-                string reportText = IntegrityManager.RunStartupCheck(manifestPath, sandboxPath);
+            var tail = string.Join(Environment.NewLine, log.TakeLast(12));
+            MessageBox.Show(string.IsNullOrWhiteSpace(tail) ? "Integrity ran (no log lines)" : tail,
+                            "System Integrity Verification",
+                            MessageBoxButton.OK, MessageBoxImage.Information);
 
-                var reportWindow = new IntegrityReportWindow(reportText);
-                reportWindow.Show();
+            // --- TEMP: Visible ping window so you *always* see *something* ---
+            var ping = new Window
+            {
+                Title = "OOS Ping",
+                Width = 320,
+                Height = 100,
+                WindowStartupLocation = WindowStartupLocation.CenterScreen,
+                Topmost = true,
+                Content = new System.Windows.Controls.TextBlock
+                {
+                    Text = "UI is alive.\nLaunching Resume...",
+                    Margin = new Thickness(16),
+                    Foreground = System.Windows.Media.Brushes.White
+                },
+                Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(32, 32, 32))
+            };
+            ping.Show();
+
+            // Close the ping after a moment so it doesn’t linger
+            Dispatcher.InvokeAsync(async () =>
+            {
+                await Task.Delay(3000);
+                if (ping.IsVisible) ping.Close();
+            });
+
+            // --- Show Resume window (NO OWNER; force CenterScreen + Topmost for first show) ---
+            try
+            {
+                var progress = new Progress(); // use your project’s Progress type if namespaced differently
+                var resume = new ResumeWindow(progress)
+                {
+                    WindowStartupLocation = WindowStartupLocation.CenterScreen,
+                    Topmost = true // only for first paint—user can alt-tab it afterwards
+                };
+                resume.Loaded += (_, __) => resume.Topmost = false; // drop Topmost after showing once
+                resume.Show();
             }
             catch (Exception ex)
             {
-                SharedLogger.Error("Integrity check failed:\n" + ex);
-            }
-            // -------------------------------------------------
-
-
-            // Start background runtime (tray icon etc.)
-            _runtime = new GameRuntime();
-            _runtime.Start();
-
-            // Determine first-run vs resume
-            var progress = Progress.Load() ?? new Progress();
-            var firstRun = string.IsNullOrWhiteSpace(progress.Checkpoint);
-
-            try
-            {
-                if (firstRun)
-                {
-                    var intro = new IntroWindow();
-                    intro.Show();
-                    // Explorer will open later after the video ends (VideoWindow handles it).
-                }
-                else
-                {
-                    var resume = new ResumeWindow(progress);
-                    resume.Show();
-                    // Explorer opens after Continue (handled in ResumeWindow).
-                }
-            }
-            catch (Exception ex)
-            {
-                SharedLogger.Error("Failed to open initial window:\n" + ex);
-                MessageBox.Show(
-                    "A critical error occurred while opening the game. Check the log for details.",
-                    "Office of Shadows",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show($"Failed to open Resume window:\n{ex}", "OOS", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
-        protected override void OnExit(ExitEventArgs e)
+        private static string ResolveSandboxPath()
         {
-            try
-            {
-                _runtime?.Dispose();
-                SharedLogger.Info("Application exiting.");
-            }
-            catch { }
-            finally
-            {
-                _singleInstanceMutex?.ReleaseMutex();
-                _singleInstanceMutex?.Dispose();
-                _singleInstanceMutex = null;
-            }
-            base.OnExit(e);
+            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            var root = Path.Combine(desktop, "Office Work Stuff");
+            Directory.CreateDirectory(root);
+            return root;
         }
     }
 }

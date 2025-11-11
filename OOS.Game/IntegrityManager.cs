@@ -1,382 +1,440 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text;
 using System.Text.Json;
+using System.Threading.Tasks;
 
-namespace OOS.Shared
+namespace OOS.Game
 {
-    public static class IntegrityManager
+    public sealed class IntegrityManager
     {
-        public static string RunStartupCheck(string manifestPath, string sandboxPath)
+        public Task RunStartupCheck(string sandboxPath, string installRoot, Action<string>? log = null)
+            => RunAllChecksAsync(sandboxPath, installRoot, log);
+
+        public async Task RunAllChecksAsync(string sandboxPath, string installRoot, Action<string>? log = null)
         {
-            var lines = new List<string>();
-            int checkedCount = 0, repairedCount = 0, seededCount = 0, warnings = 0;
+            log ??= _ => { };
 
             try
             {
-                if (string.IsNullOrWhiteSpace(sandboxPath))
-                    return "Integrity: invalid sandbox path.";
+                EnsureDirectory(sandboxPath, log, "Sandbox root");
 
-                if (!Directory.Exists(sandboxPath))
-                    Directory.CreateDirectory(sandboxPath);
+                var manifest = LoadManifestFlexible(installRoot, log);
 
-                // README
-                var readme = Path.Combine(sandboxPath, "README.txt");
-                if (!File.Exists(readme))
+                log($"[Integrity] Processing {manifest.Entries.Count} entries…");
+
+                for (int i = 0; i < manifest.Entries.Count; i++)
                 {
-                    File.WriteAllText(readme,
-@"Office of Shadows — Desktop Sandbox
-
-This folder is a safe in-game workspace. Files here may be created,
-modified, or removed by puzzles, scripts, and the in-game Terminal.
-
-— Stay vigilant.");
-                    repairedCount++;
-                    lines.Add("Seeded README.txt");
-                }
-
-                // Manifest-driven items
-                var exeDir = AppContext.BaseDirectory;
-                if (!string.IsNullOrWhiteSpace(manifestPath) && File.Exists(manifestPath))
-                {
-                    using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath));
-                    var root = doc.RootElement;
-
-                    if (TryGetFirstArray(root, new[] { "files", "items", "entries" }, out var list))
+                    var entry = manifest.Entries[i];
+                    try
                     {
-                        foreach (var el in list.EnumerateArray())
+                        log($"[Integrity] [{i + 1}/{manifest.Entries.Count}] {entry.Kind} -> {entry.Path}");
+                        var targetPath = Path.Combine(sandboxPath, entry.Path.NormalizeSlashes());
+
+                        switch (entry.Kind?.Trim().ToLowerInvariant())
                         {
-                            string? rel = TryGetString(el, "path")
-                                          ?? TryGetString(el, "relativePath")
-                                          ?? TryGetString(el, "target")
-                                          ?? TryGetString(el, "to");
+                            case "folder":
+                            case "directory":
+                                EnsureDirectory(targetPath, log, entry.Path);
+                                break;
 
-                            bool required = TryGetBool(el, "required") ?? false;
-                            string? kind = TryGetString(el, "kind") ?? TryGetString(el, "type");
+                            case "file":
+                                await EnsureFileAsync(targetPath, installRoot, entry, log);
+                                break;
 
-                            if (string.IsNullOrWhiteSpace(rel))
-                                continue;
+                            case "shortcut":
+                                await EnsureShortcutAsync(targetPath, installRoot, entry, log);
+                                break;
 
-                            rel = rel.Replace('/', Path.DirectorySeparatorChar)
-                                     .Replace('\\', Path.DirectorySeparatorChar);
-
-                            checkedCount++;
-                            var targetPath = Path.Combine(sandboxPath, rel);
-
-                            // Consider no-extension entries as directories (e.g., "Notes")
-                            bool looksDir = rel.EndsWith(Path.DirectorySeparatorChar)
-                                            || (kind?.Equals("dir", StringComparison.OrdinalIgnoreCase) ?? false)
-                                            || (kind?.Equals("directory", StringComparison.OrdinalIgnoreCase) ?? false)
-                                            || (TryGetBool(el, "isDir") ?? false)
-                                            || !Path.HasExtension(rel);
-
-                            if (looksDir)
-                            {
-                                if (!Directory.Exists(targetPath))
-                                {
-                                    Directory.CreateDirectory(targetPath);
-                                    repairedCount++;
-                                    lines.Add($"Created directory: {rel.TrimEnd(Path.DirectorySeparatorChar)}");
-                                }
-                                continue;
-                            }
-
-                            if (rel.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
-                            {
-                                HandleShortcut(rel, sandboxPath, exeDir, required, lines, ref repairedCount, ref warnings);
-                                continue;
-                            }
-
-                            var sourcePath = Path.Combine(exeDir, "Assets", rel);
-                            var dir = Path.GetDirectoryName(targetPath);
-                            if (!string.IsNullOrEmpty(dir))
-                                Directory.CreateDirectory(dir);
-
-                            if (!File.Exists(targetPath))
-                            {
-                                if (File.Exists(sourcePath))
-                                {
-                                    File.Copy(sourcePath, targetPath, overwrite: false);
-                                    repairedCount++;
-                                    lines.Add($"Restored file: {rel}");
-                                }
-                                else
-                                {
-                                    warnings++;
-                                    lines.Add($"Missing source for: {rel}");
-                                }
-                            }
+                            default:
+                                log($"[Integrity] Unknown kind \"{entry.Kind}\" for \"{entry.Path}\" – skipping.");
+                                break;
                         }
                     }
-                    else
+                    catch (Exception exEntry)
                     {
-                        lines.Add("Manifest present but contains no 'files'/'items'/'entries' array.");
-                    }
-                }
-                else
-                {
-                    lines.Add("Manifest not found; skipping manifest-driven repair.");
-                }
-
-                // Optional seed mirror
-                var seedDir = Path.Combine(AppContext.BaseDirectory, "Assets", "SandboxSeed");
-                if (Directory.Exists(seedDir))
-                {
-                    foreach (var src in Directory.GetFiles(seedDir, "*", SearchOption.AllDirectories))
-                    {
-                        var rel = Path.GetRelativePath(seedDir, src);
-                        var dst = Path.Combine(sandboxPath, rel);
-                        var dir = Path.GetDirectoryName(dst);
-                        if (!string.IsNullOrEmpty(dir))
-                            Directory.CreateDirectory(dir);
-
-                        if (!File.Exists(dst))
-                        {
-                            File.Copy(src, dst, overwrite: false);
-                            seededCount++;
-                            lines.Add($"Seeded from SandboxSeed: {rel}");
-                        }
+                        log($"[Integrity] Entry failed ({entry.Kind} {entry.Path}): {exEntry.Message}");
+                        // continue with next entry
                     }
                 }
 
-                lines.Insert(0, $"Checked: {checkedCount} | Repaired: {repairedCount} | Seeded: {seededCount}");
+                // Safety: always ensure Notes exists
+                EnsureDirectory(Path.Combine(sandboxPath, "Notes"), log, "Notes");
+
+                // Helpful README
+                await EnsureReadmeAsync(sandboxPath, log);
+
+                log("[Integrity] Completed.");
             }
             catch (Exception ex)
             {
-                var msg = "IntegrityManager.RunStartupCheck exception:\n" + ex;
-                SharedLogger.Error(msg);
-                lines.Add(msg);
+                log($"[Integrity] Fatal error: {ex}");
+                // Swallow to prevent app exit
             }
-
-            return string.Join(Environment.NewLine, lines);
         }
 
-        // ---------- Shortcuts ----------
-
-        private static void HandleShortcut(
-            string relativeLinkName,
-            string sandboxPath,
-            string exeDir,
-            bool required,
-            List<string> lines,
-            ref int repairedCount,
-            ref int warnings)
+        private sealed class Manifest
         {
-            string linkPath = Path.Combine(sandboxPath, relativeLinkName);
-            var linkDir = Path.GetDirectoryName(linkPath);
-            if (!string.IsNullOrEmpty(linkDir))
-                Directory.CreateDirectory(linkDir);
-
-            if (File.Exists(linkPath))
-            {
-                lines.Add($"Shortcut OK: {relativeLinkName}");
-                return;
-            }
-
-            string lower = relativeLinkName.ToLowerInvariant();
-
-            if (lower == "terminal.lnk")
-            {
-                string? terminalExe = FindExe(exeDir, "OOS.Terminal.exe");
-                if (terminalExe != null)
-                {
-                    var system32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
-                    var cmdIcon = Path.Combine(system32, "cmd.exe");
-
-                    if (CreateWindowsShortcut(linkPath, terminalExe, Path.GetDirectoryName(terminalExe)!, cmdIcon, 0))
-                    {
-                        repairedCount++;
-                        lines.Add("Created shortcut: Terminal.lnk");
-                    }
-                    else if (CreateUrlShortcutFallback(linkPath, terminalExe))
-                    {
-                        repairedCount++;
-                        lines.Add("Created fallback shortcut (.url): Terminal.lnk → OOS.Terminal.exe");
-                    }
-                    else
-                    {
-                        warnings++;
-                        lines.Add("Failed to create Terminal.lnk (no WSH and .url fallback failed).");
-                    }
-                }
-                else
-                {
-                    warnings++;
-                    lines.Add("Cannot locate OOS.Terminal.exe to create Terminal.lnk");
-                }
-            }
-            else if (lower == "devicemanager.lnk")
-            {
-                string? dmExe = FindExe(exeDir, "OOS.DeviceManager.exe",
-                    Path.Combine(exeDir, "Tools", "OOS.DeviceManager.exe"),
-                    Path.Combine(exeDir, "Assets", "Tools", "OOS.DeviceManager.exe"),
-                    Path.Combine(exeDir, "Assets", "OOS.DeviceManager.exe")
-                );
-
-                if (dmExe != null)
-                {
-                    if (CreateWindowsShortcut(linkPath, dmExe, Path.GetDirectoryName(dmExe)!, dmExe, 0))
-                    {
-                        repairedCount++;
-                        lines.Add("Created shortcut: DeviceManager.lnk");
-                    }
-                    else if (CreateUrlShortcutFallback(linkPath, dmExe))
-                    {
-                        repairedCount++;
-                        lines.Add("Created fallback shortcut (.url): DeviceManager.lnk → OOS.DeviceManager.exe");
-                    }
-                    else
-                    {
-                        warnings++;
-                        lines.Add("Failed to create DeviceManager.lnk (no WSH and .url fallback failed).");
-                    }
-                }
-                else
-                {
-                    warnings++;
-                    lines.Add("Cannot locate OOS.DeviceManager.exe to create DeviceManager.lnk");
-                }
-            }
-            else if (lower == "vpn.lnk" || lower == "email.lnk")
-            {
-                if (required)
-                {
-                    warnings++;
-                    lines.Add($"Missing source for: {relativeLinkName} (marked required)");
-                }
-                else
-                {
-                    lines.Add($"Optional shortcut skipped: {relativeLinkName}");
-                }
-            }
-            else
-            {
-                var assetsSource = Path.Combine(exeDir, "Assets", relativeLinkName);
-                if (File.Exists(assetsSource))
-                {
-                    File.Copy(assetsSource, linkPath, overwrite: true);
-                    repairedCount++;
-                    lines.Add($"Restored shortcut from Assets: {relativeLinkName}");
-                }
-                else
-                {
-                    warnings++;
-                    lines.Add($"Missing source for: {relativeLinkName}");
-                }
-            }
+            public List<ManifestEntry> Entries { get; set; } = new();
         }
 
-        // ---------- Exe finder (robust) ----------
-
-        private static string? FindExe(string exeDir, string exeName, params string[] preferredAbsolutePaths)
+        private sealed class ManifestEntry
         {
-            // 0) explicit preferred paths
-            foreach (var p in preferredAbsolutePaths)
-            {
-                if (!string.IsNullOrWhiteSpace(p) && File.Exists(p))
-                    return p;
-            }
-
-            // 1) same folder
-            var p1 = Path.Combine(exeDir, exeName);
-            if (File.Exists(p1)) return p1;
-
-            // 2) typical tidy locations
-            var p2 = Path.Combine(exeDir, "Tools", exeName);
-            if (File.Exists(p2)) return p2;
-
-            var p3 = Path.Combine(exeDir, "Assets", "Tools", exeName);
-            if (File.Exists(p3)) return p3;
-
-            var p4 = Path.Combine(exeDir, "Assets", exeName);
-            if (File.Exists(p4)) return p4;
-
-            // 3) walk up to solution root-ish (6 levels), search all subdirs for the exact exe name
-            try
-            {
-                var cursor = new DirectoryInfo(exeDir);
-                for (int i = 0; i < 6 && cursor?.Parent != null; i++, cursor = cursor.Parent)
-                {
-                    foreach (var f in Directory.EnumerateFiles(cursor.FullName, exeName, SearchOption.AllDirectories))
-                    {
-                        // prefer net* builds if multiple are found
-                        if (f.IndexOf("net", StringComparison.OrdinalIgnoreCase) >= 0)
-                            return f;
-                        return f;
-                    }
-                }
-            }
-            catch { /* best effort */ }
-
-            return null;
+            public string Path { get; set; } = "";
+            public string Kind { get; set; } = "";
+            public string? Source { get; set; }
+            public bool Required { get; set; } = false;
+            public string? Icon { get; set; }
+            public int IconIndex { get; set; } = 0;
+            public string? Arguments { get; set; }
         }
 
-        // ---------- Shortcut helpers ----------
-
-        private static bool CreateWindowsShortcut(string linkPath, string targetExe, string workingDir, string? iconOverridePath, int iconIndex)
+        private static void EnsureDirectory(string dir, Action<string> log, string labelForLog)
         {
             try
             {
-                var shellType = Type.GetTypeFromProgID("WScript.Shell");
-                if (shellType == null) return false;
+                if (Directory.Exists(dir))
+                    log($"[Integrity] Folder OK: {labelForLog}");
+                else
+                {
+                    Directory.CreateDirectory(dir);
+                    log($"[Integrity] Created folder: {labelForLog}");
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"[Integrity] Failed to create folder \"{labelForLog}\": {ex.Message}");
+            }
+        }
 
-                dynamic shell = Activator.CreateInstance(shellType)!;
-                dynamic shortcut = shell.CreateShortcut(linkPath);
+        private async Task EnsureFileAsync(string targetPath, string installRoot, ManifestEntry entry, Action<string> log)
+        {
+            try
+            {
+                if (File.Exists(targetPath))
+                {
+                    log($"[Integrity] File OK: {entry.Path}");
+                    return;
+                }
+
+                string? src = ResolvePathMaybe(installRoot, entry.Source);
+                Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+
+                if (!string.IsNullOrWhiteSpace(src) && File.Exists(src))
+                {
+                    File.Copy(src, targetPath, overwrite: false);
+                    log($"[Integrity] Seeded file: {entry.Path}");
+                }
+                else
+                {
+                    await File.WriteAllTextAsync(targetPath, "", Encoding.UTF8);
+                    log($"[Integrity] Created placeholder file: {entry.Path}");
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"[Integrity] Failed to create file \"{entry.Path}\": {ex.Message}");
+            }
+        }
+
+        private async Task EnsureShortcutAsync(string lnkPath, string installRoot, ManifestEntry entry, Action<string> log)
+        {
+            try
+            {
+                if (File.Exists(lnkPath))
+                {
+                    log($"[Integrity] Shortcut OK: {Path.GetFileName(lnkPath)}");
+                    return;
+                }
+
+                string? explicitTarget = ResolvePathMaybe(installRoot, entry.Source);
+                string? targetExe = explicitTarget ?? AutoDetectTargetExeFromShortcut(installRoot, lnkPath, log);
+
+                if (string.IsNullOrWhiteSpace(targetExe) || !File.Exists(targetExe))
+                {
+                    log($"[Integrity] Could not locate target EXE for \"{Path.GetFileName(lnkPath)}\" – skipping.");
+                    return;
+                }
+
+                string fileName = Path.GetFileName(lnkPath);
+                string? iconPath = ResolvePathMaybe(installRoot, entry.Icon);
+                int iconIndex = entry.IconIndex;
+
+                if (string.IsNullOrWhiteSpace(iconPath))
+                {
+                    if (fileName.Equals("Terminal.lnk", StringComparison.OrdinalIgnoreCase))
+                    {
+                        iconPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+                        if (!File.Exists(iconPath)) iconPath = targetExe;
+                        iconIndex = 0;
+                    }
+                    else
+                    {
+                        iconPath = targetExe;
+                        iconIndex = 0;
+                    }
+                }
+
+                var created = CreateShortcut(targetExe, lnkPath, entry.Arguments ?? "", iconPath!, iconIndex);
+                log(created
+                    ? $"[Integrity] Created shortcut: {Path.GetFileName(lnkPath)}"
+                    : $"[Integrity] Failed to create shortcut: {Path.GetFileName(lnkPath)}");
+
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                log($"[Integrity] Shortcut error for \"{Path.GetFileName(lnkPath)}\": {ex.Message}");
+            }
+        }
+
+        private static bool CreateShortcut(string targetExe, string lnkPath, string arguments, string iconPath, int iconIndex)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(lnkPath)!;
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+                var wshType = Type.GetTypeFromProgID("WScript.Shell");
+                if (wshType == null)
+                {
+                    // Extremely rare on Windows; log and skip
+                    return false;
+                }
+
+                dynamic wsh = Activator.CreateInstance(wshType)!;
+                dynamic shortcut = wsh.CreateShortcut(lnkPath);
+
                 shortcut.TargetPath = targetExe;
-                shortcut.WorkingDirectory = workingDir;
-                shortcut.WindowStyle = 1;
+                shortcut.WorkingDirectory = Path.GetDirectoryName(targetExe);
+                shortcut.Arguments = arguments ?? "";
 
-                if (!string.IsNullOrWhiteSpace(iconOverridePath))
-                    shortcut.IconLocation = iconOverridePath + "," + iconIndex;
+                if (!string.IsNullOrWhiteSpace(iconPath) && File.Exists(iconPath))
+                    shortcut.IconLocation = $"{iconPath},{iconIndex}";
+                else
+                    shortcut.IconLocation = targetExe;
 
-                shortcut.Description = Path.GetFileNameWithoutExtension(targetExe);
                 shortcut.Save();
-                return File.Exists(linkPath);
+
+                System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shortcut);
+                System.Runtime.InteropServices.Marshal.FinalReleaseComObject(wsh);
+                return true;
             }
-            catch { return false; }
+            catch
+            {
+                return false;
+            }
         }
 
-        private static bool CreateUrlShortcutFallback(string linkPath, string targetExe)
+        private static string? ResolvePathMaybe(string installRoot, string? maybeRelativeOrAbsolute)
+        {
+            if (string.IsNullOrWhiteSpace(maybeRelativeOrAbsolute))
+                return null;
+
+            if (Path.IsPathRooted(maybeRelativeOrAbsolute))
+                return maybeRelativeOrAbsolute;
+
+            return Path.Combine(installRoot, maybeRelativeOrAbsolute.NormalizeSlashes());
+        }
+
+        private static string? AutoDetectTargetExeFromShortcut(string installRoot, string lnkPath, Action<string> log)
+        {
+            var name = Path.GetFileName(lnkPath) ?? "";
+            var candidates = new List<string>();
+
+            if (name.Equals("Terminal.lnk", StringComparison.OrdinalIgnoreCase))
+                candidates.AddRange(new[] { "OOS.Terminal.exe", "Terminal.exe" });
+
+            if (name.Equals("DeviceManager.lnk", StringComparison.OrdinalIgnoreCase))
+                candidates.AddRange(new[] { "OOS.DeviceManager.exe", "DeviceManager.exe" });
+
+            if (name.Equals("Firewall.lnk", StringComparison.OrdinalIgnoreCase))
+                candidates.AddRange(new[] { "OOS.Firewall.exe", "Firewall.exe" });
+
+            var stem = Path.GetFileNameWithoutExtension(name);
+            if (!string.IsNullOrWhiteSpace(stem))
+                candidates.Add(stem + ".exe");
+
+            var roots = EnumerateSearchRoots(installRoot, 5).ToList();
+            roots.AddRange(EnumerateSiblingProjectBinRoots(installRoot, new[] { "OOS.Terminal", "OOS.DeviceManager", "OOS.Firewall" }));
+
+            foreach (var root in roots.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                foreach (var exeName in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    var hit = FindExeUnder(root, exeName);
+                    if (!string.IsNullOrWhiteSpace(hit))
+                    {
+                        log($"[Integrity] Resolved {name} -> {hit}");
+                        return hit;
+                    }
+                }
+            }
+
+            var sample = string.Join("; ", roots.Take(6));
+            log($"[Integrity] Auto-detect failed for {name}. Searched roots: {sample} …");
+            return null;
+        }
+
+        private static IEnumerable<string> EnumerateSearchRoots(string start, int maxAncestors)
+        {
+            var current = new DirectoryInfo(start);
+            for (int i = 0; i <= maxAncestors && current != null; i++)
+            {
+                yield return current.FullName;
+                current = current.Parent;
+            }
+        }
+
+        private static IEnumerable<string> EnumerateSiblingProjectBinRoots(string installRoot, IEnumerable<string> projectNames)
+        {
+            var roots = new List<string>();
+            var ancestors = EnumerateSearchRoots(installRoot, 5).ToArray();
+
+            foreach (var anc in ancestors)
+            {
+                foreach (var proj in projectNames)
+                {
+                    var basePath = Path.Combine(anc, proj, "bin");
+                    if (Directory.Exists(basePath)) roots.Add(basePath);
+
+                    var dbg = Path.Combine(basePath, "Debug");
+                    var rel = Path.Combine(basePath, "Release");
+                    if (Directory.Exists(dbg)) roots.Add(dbg);
+                    if (Directory.Exists(rel)) roots.Add(rel);
+                }
+            }
+            return roots;
+        }
+
+        private static string? FindExeUnder(string rootFolder, string exeName)
         {
             try
             {
-                var urlPath = Path.ChangeExtension(linkPath, ".url");
-                var uri = new Uri(targetExe);
-                File.WriteAllText(urlPath,
-                    $"[InternetShortcut]{Environment.NewLine}URL=file:///{uri.LocalPath.Replace('\\', '/')}{Environment.NewLine}");
-                return File.Exists(urlPath);
+                if (!Directory.Exists(rootFolder)) return null;
+
+                var common = new[] { ".", "bin", "bin\\Debug", "bin\\Release" };
+                foreach (var rel in common)
+                {
+                    var dir = Path.Combine(rootFolder, rel);
+                    if (!Directory.Exists(dir)) continue;
+
+                    var fast = Directory.EnumerateFiles(dir, exeName, SearchOption.AllDirectories).FirstOrDefault();
+                    if (!string.IsNullOrWhiteSpace(fast)) return fast;
+                }
+
+                return Directory.EnumerateFiles(rootFolder, exeName, SearchOption.AllDirectories).FirstOrDefault();
             }
-            catch { return false; }
+            catch
+            {
+                return null;
+            }
         }
 
-        // ---------- JSON helpers ----------
-
-        private static bool TryGetFirstArray(JsonElement obj, string[] names, out JsonElement array)
+        private static Manifest LoadManifestFlexible(string installRoot, Action<string> log)
         {
-            foreach (var n in names)
+            var candidates = new List<string>
             {
-                if (obj.TryGetProperty(n, out var el) && el.ValueKind == JsonValueKind.Array)
+                Path.Combine(installRoot, "manifest.json"),
+                Path.Combine(installRoot, "Assets", "manifest.json")
+            };
+
+            var parents = EnumerateSearchRoots(installRoot, 4).Skip(1).ToArray();
+            foreach (var p in parents)
+            {
+                candidates.Add(Path.Combine(p, "Assets", "manifest.json"));
+                candidates.Add(Path.Combine(p, "manifest.json"));
+            }
+
+            foreach (var path in candidates)
+            {
+                if (!File.Exists(path)) continue;
+
+                try
                 {
-                    array = el; return true;
+                    var json = File.ReadAllText(path, Encoding.UTF8);
+
+                    var loaded = JsonSerializer.Deserialize<Manifest>(json, new JsonSerializerOptions
+                    { PropertyNameCaseInsensitive = true });
+
+                    if (loaded?.Entries != null && loaded.Entries.Count > 0)
+                    {
+                        log($"[Integrity] Loaded manifest: {path}");
+                        return loaded;
+                    }
+
+                    var shim = JsonSerializer.Deserialize<FoxxManifestShim>(json, new JsonSerializerOptions
+                    { PropertyNameCaseInsensitive = true });
+
+                    if (shim?.Items != null && shim.Items.Count > 0)
+                    {
+                        log($"[Integrity] Loaded manifest (items-schema): {path}");
+                        return new Manifest { Entries = shim.Items };
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log($"[Integrity] Failed to parse manifest at {path}: {ex.Message}");
                 }
             }
-            array = default; return false;
+
+            log("[Integrity] manifest.json not found – using defaults.");
+            return new Manifest
+            {
+                Entries = new List<ManifestEntry>
+                {
+                    new ManifestEntry { Path = "Notes", Kind = "Folder", Required = true },
+                    new ManifestEntry { Path = "Downloads", Kind = "Folder", Required = true },
+                    new ManifestEntry { Path = "Terminal.lnk", Kind = "Shortcut", Required = true },
+                    new ManifestEntry { Path = "DeviceManager.lnk", Kind = "Shortcut", Required = true },
+                    new ManifestEntry { Path = "Firewall.lnk", Kind = "Shortcut", Required = true },
+                    new ManifestEntry { Path = "Docs\\FIREWALL_GUIDE.txt", Kind = "File", Source = "Assets\\Seed\\FIREWALL_GUIDE.txt" },
+                    new ManifestEntry { Path = "Docs\\README.txt", Kind = "File", Source = "Assets\\Seed\\README.txt" }
+                }
+            };
         }
 
-        private static string? TryGetString(JsonElement el, string name)
+        private sealed class FoxxManifestShim
         {
-            if (el.ValueKind != JsonValueKind.Object) return null;
-            if (!el.TryGetProperty(name, out var v)) return null;
-            return v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            public string? Version { get; set; }
+            public List<ManifestEntry> Items { get; set; } = new();
         }
 
-        private static bool? TryGetBool(JsonElement el, string name)
+        private static async Task EnsureReadmeAsync(string sandboxPath, Action<string> log)
         {
-            if (el.ValueKind != JsonValueKind.Object) return null;
-            if (!el.TryGetProperty(name, out var v)) return null;
-            if (v.ValueKind == JsonValueKind.True) return true;
-            if (v.ValueKind == JsonValueKind.False) return false;
-            return null;
+            try
+            {
+                var docsDir = Path.Combine(sandboxPath, "Docs");
+                if (!Directory.Exists(docsDir)) Directory.CreateDirectory(docsDir);
+
+                var readmePath = Path.Combine(docsDir, "README.txt");
+                if (File.Exists(readmePath))
+                {
+                    log("[Integrity] README OK.");
+                    return;
+                }
+
+                var text =
+@"OFFICE OF SHADOWS :: SANDBOX
+This folder emulates the Operator's desktop.
+Shortcuts launch in-world apps. Files placed here may be scanned by Antivirus.
+If something hostile arrives, quarantine or purge it.";
+                await File.WriteAllTextAsync(readmePath, text, Encoding.UTF8);
+                log("[Integrity] Seeded README.txt.");
+            }
+            catch (Exception ex)
+            {
+                log($"[Integrity] Failed to seed README: {ex.Message}");
+            }
         }
+    }
+
+    internal static class StringPathExtensions
+    {
+        public static string NormalizeSlashes(this string path)
+            => path.Replace('/', Path.DirectorySeparatorChar)
+                   .Replace('\\', Path.DirectorySeparatorChar);
     }
 }

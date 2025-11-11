@@ -1,5 +1,5 @@
 {
-  "version": "Pre-Release 1.1.6",
+  "version": "Pre-Release 1.1.7",
   "items": [
     {
       "path": "README.txt",
@@ -33,6 +33,12 @@
       "path": "Notes",
       "kind": "Directory",
       "required": true
+    },
+    {
+      "path": "Firewall.lnk",
+      "kind": "Shortcut",
+      "required": true
     }
+
   ]
 }

@@ -1,7 +1,5 @@
 ﻿<Application x:Class="OOS.Game.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <!-- No StartupUri — we control flow in App.xaml.cs -->
-    <Application.Resources>
-    </Application.Resources>
+    <Application.Resources/>
 </Application>
