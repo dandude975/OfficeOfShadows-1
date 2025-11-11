@@ -1,5 +1,5 @@
 {
-  "version": "Pre-Release 1.1.5",
+  "version": "Pre-Release 1.1.6",
   "items": [
     {
       "path": "README.txt",
@@ -11,6 +11,11 @@
     },
     {
       "path": "Terminal.lnk",
+      "kind": "Shortcut",
+      "required": true
+    },
+    {
+      "path": "DeviceManager.lnk",
       "kind": "Shortcut",
       "required": true
     },

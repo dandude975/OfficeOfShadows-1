@@ -7,12 +7,6 @@ namespace OOS.Shared
 {
     public static class IntegrityManager
     {
-        /// <summary>
-        /// Runs startup integrity/repair and returns a human-readable report.
-        /// - Ensures sandbox exists and seeds README.txt.
-        /// - Parses ./Assets/manifest.json, creating dirs/files and SPECIAL-CASE creating .lnk files.
-        /// - Mirrors any missing files from ./Assets/SandboxSeed/.
-        /// </summary>
         public static string RunStartupCheck(string manifestPath, string sandboxPath)
         {
             var lines = new List<string>();
@@ -26,7 +20,7 @@ namespace OOS.Shared
                 if (!Directory.Exists(sandboxPath))
                     Directory.CreateDirectory(sandboxPath);
 
-                // Always ensure README for immersion
+                // README
                 var readme = Path.Combine(sandboxPath, "README.txt");
                 if (!File.Exists(readme))
                 {
@@ -41,16 +35,14 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                     lines.Add("Seeded README.txt");
                 }
 
-                // ---- MANIFEST PROCESSING ----
+                // Manifest-driven items
                 var exeDir = AppContext.BaseDirectory;
                 if (!string.IsNullOrWhiteSpace(manifestPath) && File.Exists(manifestPath))
                 {
                     using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath));
                     var root = doc.RootElement;
 
-                    // Common array property names we’ll accept
-                    string[] listNames = { "files", "items", "entries" };
-                    if (TryGetFirstArray(root, listNames, out var list))
+                    if (TryGetFirstArray(root, new[] { "files", "items", "entries" }, out var list))
                     {
                         foreach (var el in list.EnumerateArray())
                         {
@@ -60,26 +52,23 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                                           ?? TryGetString(el, "to");
 
                             bool required = TryGetBool(el, "required") ?? false;
-                            string? type = TryGetString(el, "type");
+                            string? kind = TryGetString(el, "kind") ?? TryGetString(el, "type");
 
                             if (string.IsNullOrWhiteSpace(rel))
                                 continue;
 
-                            // Normalize separators
                             rel = rel.Replace('/', Path.DirectorySeparatorChar)
                                      .Replace('\\', Path.DirectorySeparatorChar);
 
                             checkedCount++;
-
                             var targetPath = Path.Combine(sandboxPath, rel);
 
-                            // Determine if entry is a directory.
-                            bool looksDir =
-                                rel.EndsWith(Path.DirectorySeparatorChar) ||
-                                (type?.Equals("dir", StringComparison.OrdinalIgnoreCase) ?? false) ||
-                                (TryGetBool(el, "isDir") ?? false) ||
-                                // NEW: treat plain names with no extension as directories (e.g., "Notes")
-                                !Path.HasExtension(rel);
+                            // Consider no-extension entries as directories (e.g., "Notes")
+                            bool looksDir = rel.EndsWith(Path.DirectorySeparatorChar)
+                                            || (kind?.Equals("dir", StringComparison.OrdinalIgnoreCase) ?? false)
+                                            || (kind?.Equals("directory", StringComparison.OrdinalIgnoreCase) ?? false)
+                                            || (TryGetBool(el, "isDir") ?? false)
+                                            || !Path.HasExtension(rel);
 
                             if (looksDir)
                             {
@@ -92,16 +81,16 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                                 continue;
                             }
 
-                            // Special-case shortcuts (.lnk)
                             if (rel.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
                             {
                                 HandleShortcut(rel, sandboxPath, exeDir, required, lines, ref repairedCount, ref warnings);
                                 continue;
                             }
 
-                            // Regular file: copy from ./Assets/<rel> if missing
                             var sourcePath = Path.Combine(exeDir, "Assets", rel);
-                            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+                            var dir = Path.GetDirectoryName(targetPath);
+                            if (!string.IsNullOrEmpty(dir))
+                                Directory.CreateDirectory(dir);
 
                             if (!File.Exists(targetPath))
                             {
@@ -129,7 +118,7 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                     lines.Add("Manifest not found; skipping manifest-driven repair.");
                 }
 
-                // ---- SandboxSeed mirror (optional) ----
+                // Optional seed mirror
                 var seedDir = Path.Combine(AppContext.BaseDirectory, "Assets", "SandboxSeed");
                 if (Directory.Exists(seedDir))
                 {
@@ -137,9 +126,12 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                     {
                         var rel = Path.GetRelativePath(seedDir, src);
                         var dst = Path.Combine(sandboxPath, rel);
+                        var dir = Path.GetDirectoryName(dst);
+                        if (!string.IsNullOrEmpty(dir))
+                            Directory.CreateDirectory(dir);
+
                         if (!File.Exists(dst))
                         {
-                            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
                             File.Copy(src, dst, overwrite: false);
                             seededCount++;
                             lines.Add($"Seeded from SandboxSeed: {rel}");
@@ -171,24 +163,27 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
             ref int warnings)
         {
             string linkPath = Path.Combine(sandboxPath, relativeLinkName);
-            Directory.CreateDirectory(Path.GetDirectoryName(linkPath)!);
+            var linkDir = Path.GetDirectoryName(linkPath);
+            if (!string.IsNullOrEmpty(linkDir))
+                Directory.CreateDirectory(linkDir);
 
-            // If the shortcut already exists, do nothing (fixes "Created shortcut" every run).
             if (File.Exists(linkPath))
             {
                 lines.Add($"Shortcut OK: {relativeLinkName}");
                 return;
             }
 
-            // Decide what the link should point to
             string lower = relativeLinkName.ToLowerInvariant();
 
             if (lower == "terminal.lnk")
             {
-                string? terminalExe = FindTerminalExe(exeDir);
+                string? terminalExe = FindExe(exeDir, "OOS.Terminal.exe");
                 if (terminalExe != null)
                 {
-                    if (CreateWindowsShortcut(linkPath, terminalExe, Path.GetDirectoryName(terminalExe)!))
+                    var system32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                    var cmdIcon = Path.Combine(system32, "cmd.exe");
+
+                    if (CreateWindowsShortcut(linkPath, terminalExe, Path.GetDirectoryName(terminalExe)!, cmdIcon, 0))
                     {
                         repairedCount++;
                         lines.Add("Created shortcut: Terminal.lnk");
@@ -210,9 +205,40 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                     lines.Add("Cannot locate OOS.Terminal.exe to create Terminal.lnk");
                 }
             }
+            else if (lower == "devicemanager.lnk")
+            {
+                string? dmExe = FindExe(exeDir, "OOS.DeviceManager.exe",
+                    Path.Combine(exeDir, "Tools", "OOS.DeviceManager.exe"),
+                    Path.Combine(exeDir, "Assets", "Tools", "OOS.DeviceManager.exe"),
+                    Path.Combine(exeDir, "Assets", "OOS.DeviceManager.exe")
+                );
+
+                if (dmExe != null)
+                {
+                    if (CreateWindowsShortcut(linkPath, dmExe, Path.GetDirectoryName(dmExe)!, dmExe, 0))
+                    {
+                        repairedCount++;
+                        lines.Add("Created shortcut: DeviceManager.lnk");
+                    }
+                    else if (CreateUrlShortcutFallback(linkPath, dmExe))
+                    {
+                        repairedCount++;
+                        lines.Add("Created fallback shortcut (.url): DeviceManager.lnk → OOS.DeviceManager.exe");
+                    }
+                    else
+                    {
+                        warnings++;
+                        lines.Add("Failed to create DeviceManager.lnk (no WSH and .url fallback failed).");
+                    }
+                }
+                else
+                {
+                    warnings++;
+                    lines.Add("Cannot locate OOS.DeviceManager.exe to create DeviceManager.lnk");
+                }
+            }
             else if (lower == "vpn.lnk" || lower == "email.lnk")
             {
-                // Optional shortcuts (by design). Only warn if required=true
                 if (required)
                 {
                     warnings++;
@@ -225,7 +251,6 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
             }
             else
             {
-                // Unknown .lnk from manifest — copy if present in Assets
                 var assetsSource = Path.Combine(exeDir, "Assets", relativeLinkName);
                 if (File.Exists(assetsSource))
                 {
@@ -241,45 +266,54 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
             }
         }
 
-        private static string? FindTerminalExe(string exeDir)
-        {
-            // 1) Same folder as the game
-            var probe1 = Path.Combine(exeDir, "OOS.Terminal.exe");
-            if (File.Exists(probe1)) return probe1;
+        // ---------- Exe finder (robust) ----------
 
-            // 2) Common dev layout: sibling project bin
+        private static string? FindExe(string exeDir, string exeName, params string[] preferredAbsolutePaths)
+        {
+            // 0) explicit preferred paths
+            foreach (var p in preferredAbsolutePaths)
+            {
+                if (!string.IsNullOrWhiteSpace(p) && File.Exists(p))
+                    return p;
+            }
+
+            // 1) same folder
+            var p1 = Path.Combine(exeDir, exeName);
+            if (File.Exists(p1)) return p1;
+
+            // 2) typical tidy locations
+            var p2 = Path.Combine(exeDir, "Tools", exeName);
+            if (File.Exists(p2)) return p2;
+
+            var p3 = Path.Combine(exeDir, "Assets", "Tools", exeName);
+            if (File.Exists(p3)) return p3;
+
+            var p4 = Path.Combine(exeDir, "Assets", exeName);
+            if (File.Exists(p4)) return p4;
+
+            // 3) walk up to solution root-ish (6 levels), search all subdirs for the exact exe name
             try
             {
-                var root = Directory.GetParent(exeDir)?.Parent?.Parent?.Parent?.FullName; // heuristic
-                if (!string.IsNullOrEmpty(root))
+                var cursor = new DirectoryInfo(exeDir);
+                for (int i = 0; i < 6 && cursor?.Parent != null; i++, cursor = cursor.Parent)
                 {
-                    var candidates = Directory.GetFiles(root, "OOS.Terminal.exe", SearchOption.AllDirectories);
-                    foreach (var c in candidates)
+                    foreach (var f in Directory.EnumerateFiles(cursor.FullName, exeName, SearchOption.AllDirectories))
                     {
-                        if (c.Contains("net", StringComparison.OrdinalIgnoreCase))
-                            return c;
+                        // prefer net* builds if multiple are found
+                        if (f.IndexOf("net", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return f;
+                        return f;
                     }
-                    if (candidates.Length > 0) return candidates[0];
                 }
             }
-            catch { /* best-effort */ }
-
-            // 3) Local recursive search
-            try
-            {
-                var candidates = Directory.GetFiles(exeDir, "OOS.Terminal.exe", SearchOption.AllDirectories);
-                if (candidates.Length > 0) return candidates[0];
-            }
-            catch { }
+            catch { /* best effort */ }
 
             return null;
         }
 
-        /// <summary>
-        /// Create a .lnk using late-bound Windows Script Host (no compile-time COM reference needed).
-        /// Sets icon to the standard cmd.exe icon.
-        /// </summary>
-        private static bool CreateWindowsShortcut(string linkPath, string targetExe, string workingDir)
+        // ---------- Shortcut helpers ----------
+
+        private static bool CreateWindowsShortcut(string linkPath, string targetExe, string workingDir, string? iconOverridePath, int iconIndex)
         {
             try
             {
@@ -290,27 +324,18 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                 dynamic shortcut = shell.CreateShortcut(linkPath);
                 shortcut.TargetPath = targetExe;
                 shortcut.WorkingDirectory = workingDir;
-                shortcut.WindowStyle = 1; // normal window
+                shortcut.WindowStyle = 1;
 
-                // Use the cmd.exe icon for the terminal shortcut
-                var system32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
-                var cmdIcon = Path.Combine(system32, "cmd.exe");
-                shortcut.IconLocation = cmdIcon + ",0";
+                if (!string.IsNullOrWhiteSpace(iconOverridePath))
+                    shortcut.IconLocation = iconOverridePath + "," + iconIndex;
 
-                shortcut.Description = "Office of Shadows Terminal";
+                shortcut.Description = Path.GetFileNameWithoutExtension(targetExe);
                 shortcut.Save();
                 return File.Exists(linkPath);
             }
-            catch
-            {
-                return false;
-            }
+            catch { return false; }
         }
 
-        /// <summary>
-        /// If .lnk creation isn't possible, write a .url Internet shortcut as a fallback.
-        /// Explorer treats it as a clickable link to the local exe.
-        /// </summary>
         private static bool CreateUrlShortcutFallback(string linkPath, string targetExe)
         {
             try
@@ -321,10 +346,7 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
                     $"[InternetShortcut]{Environment.NewLine}URL=file:///{uri.LocalPath.Replace('\\', '/')}{Environment.NewLine}");
                 return File.Exists(urlPath);
             }
-            catch
-            {
-                return false;
-            }
+            catch { return false; }
         }
 
         // ---------- JSON helpers ----------
@@ -335,24 +357,23 @@ modified, or removed by puzzles, scripts, and the in-game Terminal.
             {
                 if (obj.TryGetProperty(n, out var el) && el.ValueKind == JsonValueKind.Array)
                 {
-                    array = el;
-                    return true;
+                    array = el; return true;
                 }
             }
-            array = default;
-            return false;
+            array = default; return false;
         }
 
         private static string? TryGetString(JsonElement el, string name)
-            => el.ValueKind == JsonValueKind.Object
-               && el.TryGetProperty(name, out var v)
-               && v.ValueKind == JsonValueKind.String
-                   ? v.GetString()
-                   : null;
+        {
+            if (el.ValueKind != JsonValueKind.Object) return null;
+            if (!el.TryGetProperty(name, out var v)) return null;
+            return v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        }
 
         private static bool? TryGetBool(JsonElement el, string name)
         {
-            if (el.ValueKind != JsonValueKind.Object || !el.TryGetProperty(name, out var v)) return null;
+            if (el.ValueKind != JsonValueKind.Object) return null;
+            if (!el.TryGetProperty(name, out var v)) return null;
             if (v.ValueKind == JsonValueKind.True) return true;
             if (v.ValueKind == JsonValueKind.False) return false;
             return null;
